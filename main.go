@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
 // Config holds the configuration for the scraper
@@ -17,15 +23,22 @@ type Config struct {
 	RetryDelay     time.Duration
 	RateLimitDelay time.Duration
 	UserAgents     []string
+	InputFile      string
+	OutputFile     string
+	Selectors      map[string]string
+	NumWorkers     int
 }
 
 // Result represents the result of scraping a URL
 type Result struct {
-	URL      string
-	Content  string
-	Err      error
-	Duration time.Duration
-	Retries  int
+	URL        string            `json:"url"`
+	Content    string            `json:"content,omitempty"`
+	Extracted  map[string]string `json:"extracted,omitempty"`
+	Err        string            `json:"error,omitempty"`
+	Duration   time.Duration     `json:"duration"`
+	Retries    int               `json:"retries"`
+	StatusCode int               `json:"status_code,omitempty"`
+	Timestamp  time.Time         `json:"timestamp"`
 }
 
 // fetchURL fetches the content of a URL and returns a Result
@@ -33,6 +46,7 @@ func fetchURL(url string, config Config) Result {
 	start := time.Now()
 	var retries int
 	var lastErr error
+	var statusCode int
 
 	// Create a client with a timeout
 	client := &http.Client{
@@ -71,6 +85,7 @@ func fetchURL(url string, config Config) Result {
 
 		// Ensure the response body is closed
 		defer resp.Body.Close()
+		statusCode = resp.StatusCode
 
 		// Check for non-200 status codes
 		if resp.StatusCode != http.StatusOK {
@@ -79,8 +94,26 @@ func fetchURL(url string, config Config) Result {
 			continue
 		}
 
-		// Read the response body
-		body, err := ioutil.ReadAll(resp.Body)
+		// Create a goquery document for HTML parsing
+		doc, err := goquery.NewDocumentFromReader(resp.Body)
+		if err != nil {
+			lastErr = err
+			retries++
+			continue
+		}
+
+		// Extract data using selectors
+		extracted := make(map[string]string)
+		for name, selector := range config.Selectors {
+			doc.Find(selector).Each(func(i int, s *goquery.Selection) {
+				if i == 0 { // Just take the first match for simplicity
+					extracted[name] = strings.TrimSpace(s.Text())
+				}
+			})
+		}
+
+		// Get the HTML content
+		html, err := doc.Html()
 		if err != nil {
 			lastErr = err
 			retries++
@@ -89,21 +122,27 @@ func fetchURL(url string, config Config) Result {
 
 		// Success! Return the result
 		return Result{
-			URL:      url,
-			Content:  string(body),
-			Err:      nil,
-			Duration: time.Since(start),
-			Retries:  retries,
+			URL:        url,
+			Content:    html,
+			Extracted:  extracted,
+			Err:        "",
+			Duration:   time.Since(start),
+			Retries:    retries,
+			StatusCode: statusCode,
+			Timestamp:  time.Now(),
 		}
 	}
 
 	// If we get here, all retries failed
 	return Result{
-		URL:      url,
-		Content:  "",
-		Err:      lastErr,
-		Duration: time.Since(start),
-		Retries:  retries,
+		URL:        url,
+		Content:    "",
+		Extracted:  nil,
+		Err:        lastErr.Error(),
+		Duration:   time.Since(start),
+		Retries:    retries,
+		StatusCode: statusCode,
+		Timestamp:  time.Now(),
 	}
 }
 
@@ -121,14 +160,66 @@ func worker(id int, jobs <-chan string, results chan<- Result, config Config, ra
 	}
 }
 
+// readURLsFromFile reads URLs from a file, one URL per line
+func readURLsFromFile(filename string) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var urls []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		url := strings.TrimSpace(scanner.Text())
+		if url != "" && !strings.HasPrefix(url, "#") {
+			urls = append(urls, url)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return urls, nil
+}
+
+// saveResultsToFile saves the results to a JSON file
+func saveResultsToFile(results []Result, filename string) error {
+	data, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(filename, data, 0644)
+}
+
 func main() {
+	// Define command-line flags
+	inputFile := flag.String("input", "", "File containing URLs to scrape (one per line)")
+	outputFile := flag.String("output", "results.json", "File to save results to (JSON format)")
+	numWorkers := flag.Int("workers", 3, "Number of concurrent workers")
+	rateLimitDelay := flag.Duration("rate-limit", 1*time.Second, "Delay between requests")
+	maxRetries := flag.Int("retries", 3, "Maximum number of retries per URL")
+	retryDelay := flag.Duration("retry-delay", 2*time.Second, "Base delay between retries")
+	titleSelector := flag.String("title-selector", "title", "CSS selector for title extraction")
+	headingSelector := flag.String("heading-selector", "h1", "CSS selector for heading extraction")
+	flag.Parse()
+
 	fmt.Println("Concurrent Web Scraper Starting...")
 
 	// Configure the scraper
 	config := Config{
-		MaxRetries:     3,
-		RetryDelay:     2 * time.Second,
-		RateLimitDelay: 1 * time.Second,
+		MaxRetries:     *maxRetries,
+		RetryDelay:     *retryDelay,
+		RateLimitDelay: *rateLimitDelay,
+		InputFile:      *inputFile,
+		OutputFile:     *outputFile,
+		NumWorkers:     *numWorkers,
+		Selectors: map[string]string{
+			"title":   *titleSelector,
+			"heading": *headingSelector,
+		},
 		UserAgents: []string{
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
@@ -139,13 +230,30 @@ func main() {
 	// Seed the random number generator
 	rand.Seed(time.Now().UnixNano())
 
-	// Sample URLs to scrape
-	urls := []string{
-		"https://www.google.com",
-		"https://www.github.com",
-		"https://www.golang.org",
-		"https://www.wikipedia.org",
-		"https://www.reddit.com",
+	// Get URLs to scrape
+	var urls []string
+	if config.InputFile != "" {
+		// Read URLs from file
+		var err error
+		urls, err = readURLsFromFile(config.InputFile)
+		if err != nil {
+			log.Fatalf("Error reading URLs from file: %v", err)
+		}
+		fmt.Printf("Read %d URLs from %s\n", len(urls), config.InputFile)
+	} else {
+		// Use default URLs
+		urls = []string{
+			"https://www.google.com",
+			"https://www.github.com",
+			"https://www.golang.org",
+			"https://www.wikipedia.org",
+			"https://www.reddit.com",
+		}
+		fmt.Println("Using default URLs (no input file provided)")
+	}
+
+	if len(urls) == 0 {
+		log.Fatal("No URLs to scrape")
 	}
 
 	// Create channels for jobs and results
@@ -160,8 +268,7 @@ func main() {
 	defer rateLimiter.Stop()
 
 	// Start workers
-	numWorkers := 3 // Number of concurrent workers
-	for w := 1; w <= numWorkers; w++ {
+	for w := 1; w <= config.NumWorkers; w++ {
 		wg.Add(1)
 		go worker(w, jobs, results, config, rateLimiter, &wg)
 	}
@@ -178,21 +285,35 @@ func main() {
 		close(results)
 	}()
 
-	// Collect and print results
+	// Collect results
+	var allResults []Result
 	successCount := 0
 	failureCount := 0
 
 	for result := range results {
-		if result.Err != nil {
-			fmt.Printf("Error fetching %s: %v (after %d retries)\n", result.URL, result.Err, result.Retries)
+		allResults = append(allResults, result)
+
+		if result.Err != "" {
+			fmt.Printf("Error fetching %s: %s (after %d retries)\n", result.URL, result.Err, result.Retries)
 			failureCount++
 			continue
 		}
 
-		fmt.Printf("Successfully fetched %s in %v (retries: %d). Content length: %d bytes\n",
-			result.URL, result.Duration, result.Retries, len(result.Content))
+		fmt.Printf("Successfully fetched %s in %v (retries: %d)\n", result.URL, result.Duration, result.Retries)
+		if len(result.Extracted) > 0 {
+			fmt.Println("Extracted data:")
+			for name, value := range result.Extracted {
+				fmt.Printf("  %s: %s\n", name, value)
+			}
+		}
 		successCount++
 	}
 
+	// Save results to file
+	if err := saveResultsToFile(allResults, config.OutputFile); err != nil {
+		log.Fatalf("Error saving results to file: %v", err)
+	}
+
 	fmt.Printf("All URLs have been processed. Success: %d, Failures: %d\n", successCount, failureCount)
+	fmt.Printf("Results saved to %s\n", config.OutputFile)
 }
