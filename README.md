@@ -25,7 +25,7 @@ A powerful, concurrent web scraper built in Go that leverages goroutines and cha
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/concurrent-web-scraper.git
+git clone https://github.com/williampepple1/concurrent-web-scraper.git
 cd concurrent-web-scraper
 
 # Install dependencies
